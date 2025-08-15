@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
 """
-Tab Snippet Extractor for YouTube Guitar Videos
-------------------------------------------------
-Updated: Downloads video to script directory, auto-generates output filename, optional --keep video.
+Advanced Tab Snippet Extractor with Segment-based Deduplication
+---------------------------------------------------------------
+- Downloads video to script directory
+- Auto-generates output filename
+- Optional --keep video
+- Improved deduplication using segment comparison
 """
 import argparse
 import math
@@ -124,8 +127,70 @@ def parse_crop(s: str) -> Tuple[int, int, int, int]:
     return tuple(parts)
 
 
+def create_comparison_region(frame: np.ndarray) -> np.ndarray:
+    """Create the comparison region by removing top 15% and right 25%"""
+    h, w = frame.shape[:2]
+    # Remove top 15%
+    top_crop = int(h * 0.15)
+    # Remove right 25%
+    right_crop = int(w * 0.25)
+    return frame[top_crop:, :-right_crop]
+
+
+def split_into_fifths(frame: np.ndarray) -> List[np.ndarray]:
+    """Split frame into 5 horizontal segments"""
+    h, w = frame.shape[:2]
+    segment_width = w // 5
+    segments = []
+    for i in range(5):
+        start_x = i * segment_width
+        end_x = (i + 1) * segment_width if i < 4 else w
+        segments.append(frame[:, start_x:end_x])
+    return segments
+
+
+def segments_are_similar(seg1: np.ndarray, seg2: np.ndarray, hash_thresh: int) -> bool:
+    """Check if two segments are similar using perceptual hash"""
+    try:
+        hash1 = phash(seg1)
+        hash2 = phash(seg2)
+        return hamming(hash1, hash2) <= hash_thresh
+    except:
+        # Fallback to pixel difference if hashing fails
+        if seg1.shape != seg2.shape:
+            return False
+        diff = cv2.absdiff(seg1, seg2)
+        return np.mean(diff) < 10
+
+
+def should_stitch(current_frame: np.ndarray, last_stitched_frame: np.ndarray, hash_thresh: int) -> bool:
+    """
+    Determine if we should stitch current frame by comparing segments.
+    Only stitch if at least 3 segments are different (meaning 2 or fewer are the same).
+    """
+    if last_stitched_frame is None:
+        return True  # Always stitch first frame
+    
+    # Create comparison regions
+    current_comp = create_comparison_region(current_frame)
+    last_comp = create_comparison_region(last_stitched_frame)
+    
+    # Split into fifths
+    current_segments = split_into_fifths(current_comp)
+    last_segments = split_into_fifths(last_comp)
+    
+    # Count similar segments
+    similar_count = 0
+    for i in range(5):
+        if segments_are_similar(current_segments[i], last_segments[i], hash_thresh):
+            similar_count += 1
+    
+    # Only stitch if 3 or more segments are different (meaning 2 or fewer are the same)
+    return similar_count < 3
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Extract and stitch guitar tab snippets from a YouTube/local video.")
+    ap = argparse.ArgumentParser(description="Extract and stitch guitar tab snippets from a YouTube/local video with segment-based deduplication.")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--url", help="YouTube URL to download & process")
     src.add_argument("--video", help="Path to a local video file to process")
@@ -168,9 +233,13 @@ def main():
         sys.exit(2)
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
     duration = total_frames / fps if total_frames > 0 else None
-    print(f"Video FPS: {fps:.3f} | Frames: {total_frames} | Duration: {duration:.2f}s" if duration else f"Video FPS: {fps:.3f}")
+    
+    if duration:
+        print(f"Video FPS: {fps:.3f} | Frames: {total_frames} | Duration: {duration:.2f}s")
+    else:
+        print(f"Video FPS: {fps:.3f}")
 
     step = max(1, int(round(fps / args.sample_fps)))
     t_per_sample = step / fps
@@ -184,6 +253,8 @@ def main():
     current_imgs: List[Tuple[np.ndarray, float]] = []
     snippets: List[Snippet] = []
     segment_start_t = 0.0
+    last_stitched_frame = None
+    filtered_snippets: List[Snippet] = []
 
     while True:
         ret, frame = cap.read()
@@ -236,8 +307,18 @@ def main():
         print("No snippets detected. Try lowering --hash-thresh or increasing --sample-fps.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Detected {len(snippets)} snippets. Stitching...")
-    stitched = stitch_vertical([s.best_img for s in snippets], pad=16)
+    # Apply segment-based deduplication
+    for snippet in snippets:
+        if should_stitch(snippet.best_img, last_stitched_frame, args.hash_thresh):
+            filtered_snippets.append(snippet)
+            last_stitched_frame = snippet.best_img
+
+    if not filtered_snippets:
+        print("After deduplication, no snippets remain. Try lowering --hash-thresh.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Detected {len(snippets)} snippets, kept {len(filtered_snippets)} after deduplication. Stitching...")
+    stitched = stitch_vertical([s.best_img for s in filtered_snippets], pad=16)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     cv2.imwrite(args.out, stitched)

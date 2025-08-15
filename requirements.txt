@@ -3,3 +3,5 @@ numpy
 Pillow
 imagehash
 yt-dlp
+python-multipart
+scikit-image
